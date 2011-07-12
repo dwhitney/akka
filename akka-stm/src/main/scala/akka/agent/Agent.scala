@@ -92,10 +92,32 @@ object Agent {
  * agent4.close
  * }}}
  */
-class Agent[T](initialValue: T) {
+class Agent[T](
+  initialValue: T, 
+  initialWatchers: List[Watcher[T]] = Nil, 
+  initialErrorHandler: Option[Throwable => Unit] = None, 
+  initialValidator: Option[T => Either[Throwable, T]] = None, 
+  initialErrorMode: ErrorMode = Continue) {
+    
   private[akka] val ref = Ref(initialValue)
   private[akka] val updater = Actor.actorOf(new AgentUpdater(this)).start()
-
+  private[akka] val watchersRef = Ref(initialWatchers)
+  private[akka] val errorHandlerRef = Ref(initialErrorHandler)
+  private[akka] val validatorRef = Ref(initialValidator)
+  private[akka] val errorModeRef = Ref(initialErrorMode)
+  
+  def addWatcher(watcher: Watcher[T]): Unit = atomic{ watchersRef() = watcher :: watchersRef() }
+  def removeWatcher(id: String): Unit = atomic{ watchersRef() = watchersRef().filter(_.id != id) }
+  def watchers: List[Watcher[T]] = watchersRef.get
+  def errorHandler_=(fn: Throwable => Unit): Unit = atomic{ errorHandlerRef.set(Some(fn)) }
+  def errorHandler: Option[Throwable => Unit] = errorHandlerRef.get
+  def removeErrorHandler: Unit = atomic{ errorHandlerRef() = None }
+  def validator_=(fn: T => Either[Throwable, T]): Unit = atomic{ validatorRef.set(Some(fn)) }
+  def validator: Option[T => Either[Throwable, T]] = validatorRef.get
+  def removeValidator: Unit = atomic{ validatorRef.set(None) }
+  def errorMode_=(errorMode: ErrorMode): Unit = atomic{ errorModeRef.set(errorMode)}
+  def errorMode: ErrorMode = errorModeRef.get
+ 
   /**
    * Read the internal state of the agent.
    */
@@ -275,15 +297,24 @@ class Agent[T](initialValue: T) {
   def foreach(f: JProc[T]): Unit = f(get)
 }
 
+sealed trait ErrorMode
+case object Continue extends ErrorMode
+case object Fail extends ErrorMode
+
 /**
  * Agent updater actor. Used internally for `send` actions.
  */
-class AgentUpdater[T](agent: Agent[T]) extends Actor {
+class AgentUpdater[T](agent: Agent[T], watchers: List[Watcher[T]] = Nil) extends Actor {
   val txFactory = TransactionFactory(familyName = "AgentUpdater", readonly = false)
 
   def receive = {
     case update: Update[T] ⇒
-      self.reply_?(atomic(txFactory) { agent.ref alter update.function })
+      self.reply_?(atomic(txFactory) { 
+        val oldValue = agent.get
+        agent.ref alter update.function
+        watchers.foreach(_.watch(agent, oldValue))
+        agent.get
+      })
     case Get ⇒ self reply agent.get
     case _   ⇒ ()
   }
@@ -292,14 +323,19 @@ class AgentUpdater[T](agent: Agent[T]) extends Actor {
 /**
  * Thread-based agent updater actor. Used internally for `sendOff` actions.
  */
-class ThreadBasedAgentUpdater[T](agent: Agent[T]) extends Actor {
+class ThreadBasedAgentUpdater[T](agent: Agent[T], watchers: List[Watcher[T]] = Nil) extends Actor {
   self.dispatcher = Dispatchers.newPinnedDispatcher(self)
 
   val txFactory = TransactionFactory(familyName = "ThreadBasedAgentUpdater", readonly = false)
 
   def receive = {
     case update: Update[T] ⇒ try {
-      self.reply_?(atomic(txFactory) { agent.ref alter update.function })
+      self.reply_?(atomic(txFactory) { 
+        val oldValue = agent.get
+        agent.ref alter update.function
+        watchers.foreach(_.watch(agent, oldValue))
+        agent.get
+      })
     } finally {
       agent.resume
       self.stop()
